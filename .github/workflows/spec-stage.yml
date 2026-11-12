@@ -1,0 +1,192 @@
+name: Spec stage
+run-name: Spec stage ${{ inputs.story_id }} (${{ inputs.mode }})
+
+on:
+  workflow_dispatch:
+    inputs:
+      story_id:
+        description: Story id, for example DEMO-1
+        required: true
+        type: string
+      issue_number:
+        description: Story issue number
+        required: true
+        type: string
+      pr_number:
+        description: Specification PR number
+        required: true
+        type: string
+      mode:
+        description: initial drafts from the clarification, revise applies PM feedback
+        required: true
+        type: choice
+        options: [initial, revise]
+        default: initial
+      feedback:
+        description: PM feedback (revise only)
+        required: false
+        type: string
+        default: ''
+
+concurrency:
+  group: spec-${{ inputs.story_id }}
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  begin:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: read
+    outputs:
+      proceed: ${{ steps.pre.outputs.proceed }}
+      branch: ${{ steps.pre.outputs.branch }}
+      clarification_sha: ${{ steps.pre.outputs.clarification_sha }}
+      prev_spec_commit: ${{ steps.pre.outputs.prev_spec_commit }}
+    steps:
+      - name: Preflight
+        id: pre
+        env:
+          GH_TOKEN: ${{ github.token }}
+          STORY_ID: ${{ inputs.story_id }}
+          ISSUE: ${{ inputs.issue_number }}
+          PR: ${{ inputs.pr_number }}
+          MODE: ${{ inputs.mode }}
+          FEEDBACK: ${{ inputs.feedback }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$1"; exit 1; }
+          [[ "$STORY_ID" =~ ^[A-Z][A-Z0-9]*-[0-9]+$ ]] || fail "Invalid story_id '$STORY_ID'"
+          [[ "$ISSUE" =~ ^[0-9]+$ && "$PR" =~ ^[0-9]+$ ]] || fail "issue_number and pr_number must be numbers"
+          BRANCH="story/$STORY_ID"
+          if [ "$MODE" = "revise" ] && [ -z "$(printf '%s' "$FEEDBACK" | tr -d '[:space:]')" ]; then
+            fail "Revise mode needs feedback"
+          fi
+
+          read -r PR_STATE PR_HEAD < <(gh pr view "$PR" --repo "$GITHUB_REPOSITORY" --json state,headRefName --jq '"\(.state) \(.headRefName)"')
+          [ "$PR_HEAD" = "$BRANCH" ] || fail "PR #$PR is on '$PR_HEAD', expected '$BRANCH'"
+
+          LABELS=$(gh issue view "$ISSUE" --repo "$GITHUB_REPOSITORY" --json labels --jq '[.labels[].name] | join(",")')
+          if [ "$PR_STATE" != "OPEN" ] || [[ ",$LABELS," == *",spec-approved,"* ]]; then
+            gh issue comment "$ISSUE" --repo "$GITHUB_REPOSITORY" \
+              --body "Spec stage skipped for $STORY_ID: PR #$PR is $PR_STATE or the story is already approved."
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          CLAR_SHA=$(gh api "repos/$GITHUB_REPOSITORY/contents/stories/$STORY_ID/clarification.md?ref=$BRANCH" --jq .sha)
+          PREV=$(gh api "repos/$GITHUB_REPOSITORY/commits?sha=$BRANCH&path=stories/$STORY_ID/specification.md&per_page=1" --jq '.[0].sha // ""')
+          {
+            echo "proceed=true"
+            echo "branch=$BRANCH"
+            echo "clarification_sha=$CLAR_SHA"
+            echo "prev_spec_commit=$PREV"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Set state to drafting
+        if: steps.pre.outputs.proceed == 'true'
+        uses: Ajay-vishal3/agents-repo/actions/story-state@main
+        with:
+          repo: ${{ github.repository }}
+          issue: ${{ inputs.issue_number }}
+          state: drafting
+          github-token: ${{ github.token }}
+          project-token: ${{ secrets.PROJECT_TOKEN }}
+          project-owner: ${{ vars.PROJECT_OWNER || 'Ajay-vishal3' }}
+          project-number: ${{ vars.PROJECT_NUMBER || '4' }}
+
+  agent:
+    needs: begin
+    if: needs.begin.outputs.proceed == 'true'
+    permissions:
+      actions: read
+      checks: read
+      contents: write
+      issues: write
+      pull-requests: read
+      copilot-requests: write
+    uses: Ajay-vishal3/agents-repo/.github/workflows/spec-agent.lock.yml@main
+    with:
+      story_id: ${{ inputs.story_id }}
+      branch: ${{ needs.begin.outputs.branch }}
+      mode: ${{ inputs.mode }}
+      clarification_sha: ${{ needs.begin.outputs.clarification_sha }}
+      feedback: ${{ inputs.feedback }}
+    secrets: inherit
+
+  finish:
+    needs: [begin, agent]
+    if: always() && needs.begin.outputs.proceed != 'false'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+    steps:
+      - name: Verify the draft was committed
+        id: verify
+        env:
+          GH_TOKEN: ${{ github.token }}
+          STORY_ID: ${{ inputs.story_id }}
+          BEGIN_RESULT: ${{ needs.begin.result }}
+          AGENT_RESULT: ${{ needs.agent.result }}
+          PREV_COMMIT: ${{ needs.begin.outputs.prev_spec_commit }}
+        run: |
+          set -euo pipefail
+          OK=false
+          REASON=""
+          NEW=""
+          if [ "$BEGIN_RESULT" != "success" ]; then
+            REASON="preflight checks failed"
+          elif [ "$AGENT_RESULT" != "success" ]; then
+            REASON="the spec agent run ended with '$AGENT_RESULT'"
+          else
+            NEW=$(gh api "repos/$GITHUB_REPOSITORY/commits?sha=story/$STORY_ID&path=stories/$STORY_ID/specification.md&per_page=1" --jq '.[0].sha // ""')
+            if [ -z "$NEW" ] || [ "$NEW" = "$PREV_COMMIT" ]; then
+              REASON="the agent finished but did not commit a new specification draft"
+            else
+              OK=true
+            fi
+          fi
+          {
+            echo "ok=$OK"
+            echo "reason=$REASON"
+            echo "commit=$NEW"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Set state
+        uses: Ajay-vishal3/agents-repo/actions/story-state@main
+        with:
+          repo: ${{ github.repository }}
+          issue: ${{ inputs.issue_number }}
+          state: ${{ steps.verify.outputs.ok == 'true' && 'in-review' || 'error' }}
+          github-token: ${{ github.token }}
+          project-token: ${{ secrets.PROJECT_TOKEN }}
+          project-owner: ${{ vars.PROJECT_OWNER || 'Ajay-vishal3' }}
+          project-number: ${{ vars.PROJECT_NUMBER || '4' }}
+
+      - name: Notify
+        env:
+          GH_TOKEN: ${{ github.token }}
+          STORY_ID: ${{ inputs.story_id }}
+          ISSUE: ${{ inputs.issue_number }}
+          PR: ${{ inputs.pr_number }}
+          MODE: ${{ inputs.mode }}
+          OK: ${{ steps.verify.outputs.ok }}
+          REASON: ${{ steps.verify.outputs.reason }}
+          COMMIT: ${{ steps.verify.outputs.commit }}
+          PM: ${{ vars.PM_USERNAME || 'Ajay-vishal3' }}
+        run: |
+          set -euo pipefail
+          RUN_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          if [ "$OK" = "true" ]; then
+            gh pr edit "$PR" --repo "$GITHUB_REPOSITORY" --add-reviewer "$PM" >/dev/null 2>&1 || true
+            gh issue comment "$ISSUE" --repo "$GITHUB_REPOSITORY" --body "@$PM the $MODE draft of the specification for $STORY_ID is ready (\`${COMMIT:0:7}\`). Please review PR #$PR: **Approve** to accept it, or **Request changes** with feedback for a new draft. ([run]($RUN_URL))"
+          else
+            gh issue comment "$ISSUE" --repo "$GITHUB_REPOSITORY" --body "Spec stage failed for $STORY_ID: $REASON. See the [run]($RUN_URL). To retry with the same inputs, use **Re-run all jobs** on that run; to start over, push a new commit to the clarification file."
+          fi

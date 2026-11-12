@@ -1,0 +1,35 @@
+name: Review gate
+
+on:
+  pull_request_review:
+    types: [submitted]
+
+concurrency:
+  group: review-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  review:
+    if: >-
+      startsWith(github.event.pull_request.head.ref, 'story/') &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+      actions: write
+    steps:
+      - uses: Ajay-vishal3/agents-repo/actions/review-gate@main
+        with:
+          repo: ${{ github.repository }}
+          event-path: ${{ github.event_path }}
+          github-token: ${{ github.token }}
+          pm-username: ${{ vars.PM_USERNAME || 'Ajay-vishal3' }}
+          max-revisions: ${{ vars.MAX_REVISIONS || '5' }}
+          project-token: ${{ secrets.PROJECT_TOKEN }}
+          project-owner: ${{ vars.PROJECT_OWNER || 'Ajay-vishal3' }}
+          project-number: ${{ vars.PROJECT_NUMBER || '4' }}

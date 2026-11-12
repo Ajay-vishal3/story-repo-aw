@@ -1,0 +1,38 @@
+name: Intake
+
+# Runs on the pushed story branch, so story branches must be cut from the default branch
+# after this file exists. Everything else runs from the default branch.
+on:
+  push:
+    branches: ['story/**']
+    paths: ['stories/*/clarification.md']
+
+concurrency:
+  group: intake-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  intake:
+    if: github.event.deleted == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+      actions: write
+    steps:
+      - uses: Ajay-vishal3/agents-repo/actions/intake@main
+        with:
+          repo: ${{ github.repository }}
+          branch: ${{ github.ref_name }}
+          sha: ${{ github.sha }}
+          before: ${{ github.event.before }}
+          default-branch: ${{ github.event.repository.default_branch }}
+          github-token: ${{ github.token }}
+          pm-username: ${{ vars.PM_USERNAME || 'Ajay-vishal3' }}
+          project-token: ${{ secrets.PROJECT_TOKEN }}
+          project-owner: ${{ vars.PROJECT_OWNER || 'Ajay-vishal3' }}
+          project-number: ${{ vars.PROJECT_NUMBER || '4' }}
